@@ -426,7 +426,8 @@ bool MergeTask::VerticalMergeStage::prepareVerticalMergeForAllColumns() const
     if (global_ctx->chosen_merge_algorithm != MergeAlgorithm::Vertical)
         return false;
 
-    size_t sum_input_rows_exact = global_ctx->merge_list_element_ptr->rows_read;
+//
+    size_t sum_input_rows_exact = global_ctx->merge_list_element_ptr->rows_read - global_ctx->rows_filtered;
     global_ctx->merge_list_element_ptr->columns_written = global_ctx->merging_column_names.size();
     global_ctx->merge_list_element_ptr->progress.store(ctx->column_sizes->keyColumnsWeight(), std::memory_order_relaxed);
 
@@ -435,15 +436,17 @@ bool MergeTask::VerticalMergeStage::prepareVerticalMergeForAllColumns() const
     /// Ensure data has written to disk.
     ctx->rows_sources_uncompressed_write_buf->finalize();
 
+//
     size_t rows_sources_count = ctx->rows_sources_write_buf->count();
     /// In special case, when there is only one source part, and no rows were skipped, we may have
     /// skipped writing rows_sources file. Otherwise rows_sources_count must be equal to the total
     /// number of input rows.
+//*
     if ((rows_sources_count > 0 || global_ctx->future_part->parts.size() > 1) && sum_input_rows_exact != rows_sources_count)
         throw Exception("Number of rows in source parts (" + toString(sum_input_rows_exact)
             + ") differs from number of bytes written to rows_sources file (" + toString(rows_sources_count)
             + "). It is a bug.", ErrorCodes::LOGICAL_ERROR);
-
+//*/
     ctx->rows_sources_read_buf = std::make_unique<CompressedReadBufferFromFile>(ctx->tmp_disk->readFile(fileName(ctx->rows_sources_file->path())));
 
     /// For external cycle
@@ -464,13 +467,32 @@ void MergeTask::VerticalMergeStage::prepareVerticalMergeForOneColumn() const
 
     global_ctx->column_progress = std::make_unique<MergeStageProgress>(ctx->progress_before, ctx->column_sizes->columnWeight(column_name));
 
+    const auto lightweight_delete_filter_column = LightweightDeleteDescription::FILTER_COLUMN.name;
+
     Pipes pipes;
     for (size_t part_num = 0; part_num < global_ctx->future_part->parts.size(); ++part_num)
     {
-        auto column_part_source = std::make_shared<MergeTreeSequentialSource>(
-            *global_ctx->data, global_ctx->storage_snapshot, global_ctx->future_part->parts[part_num], column_names, ctx->read_with_direct_io, true);
+        /// The part might have some rows masked by lightweight deletes
+        const bool need_to_filter_deleted_rows = global_ctx->future_part->parts[part_num]->hasLightweightDelete();
+        auto columns = column_names;
+        if (need_to_filter_deleted_rows)
+            columns.emplace_back(lightweight_delete_filter_column);
 
-        pipes.emplace_back(std::move(column_part_source));
+        auto column_part_source = std::make_shared<MergeTreeSequentialSource>(
+            *global_ctx->data, global_ctx->storage_snapshot, global_ctx->future_part->parts[part_num], columns, ctx->read_with_direct_io, true);
+
+        Pipe pipe(std::move(column_part_source));
+
+        /// Add filtering step that discards deleted rows
+        if (need_to_filter_deleted_rows)
+        {
+            pipe.addSimpleTransform([lightweight_delete_filter_column](const Block & header)
+            {
+                return std::make_shared<FilterTransform>(header, nullptr, lightweight_delete_filter_column, true);
+            });
+        }
+
+        pipes.emplace_back(std::move(pipe));
     }
 
     auto pipe = Pipe::unitePipes(std::move(pipes));
@@ -825,9 +847,9 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream()
         /// Add filtering step that discards deleted rows
         if (need_to_filter_deleted_rows)
         {
-            pipe.addSimpleTransform([lightweight_delete_filter_column](const Block & header)
+            pipe.addSimpleTransform([lightweight_delete_filter_column, this](const Block & header)
             {
-                return std::make_shared<FilterTransform>(header, nullptr, lightweight_delete_filter_column, true);
+                return std::make_shared<FilterTransform>(header, nullptr, lightweight_delete_filter_column, true, false, &global_ctx->rows_filtered);
             });
         }
 

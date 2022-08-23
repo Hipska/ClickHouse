@@ -170,6 +170,7 @@ private:
         MergeTreeData::MutableDataPartPtr new_data_part{nullptr};
         DataPartStorageBuilderPtr data_part_storage_builder;
 
+        std::atomic<Int64> rows_filtered{0}; // TODO:
         size_t rows_written{0};
         UInt64 watch_prev_elapsed{0};
 
